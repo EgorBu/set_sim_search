@@ -48,34 +48,101 @@ class SetSimSearcher:
         self.n_cores = n_cores
         self._init_empty_index()
 
-    def _init_empty_index(self):
-        """Initialize empty datastructures for index"""
-        self.index_data = None
-        self.index_pointers = None
-        self.index = None
-        self.feature_to_frequency_id = None
-        self.feature_index_size = None
-        self.feature_to_index = None
-        self.entities_names = None
+    def query(self, features: Sequence[Hashable]) -> Set[Tuple[Union[Any, int], float]]:
+        """
+        Query features to index
+        :param features: feature vector
+        :return: list of tuples `(candidate_entity_name/candidate_index, similarity_score)` for truly similar vectors
+        """
+        query_features = self._encode_queries([features])
+        query_data, _ = utils.frequency_order_transform_queries(
+            queries_dataset=query_features,
+            feature_to_frequency_id=self.feature_to_frequency_id,
+        )
+        result_set = utils.query(
+            similarity_metric_name=self.similarity_metric,
+            query_features=query_data,
+            index=self.index,
+            feature_index_size=self.feature_index_size,
+            index_data=self.index_data,
+            index_pointers=self.index_pointers,
+            similarity_threshold=self.similarity_threshold,
+        )
+        return {
+            (self.entities_names[candidate_index], similarity_score)
+            for candidate_index, similarity_score in result_set
+        }
 
-    def _encode_features(
-        self, dataset: Iterable[Sequence[Hashable]]
-    ) -> Iterable[np.ndarray]:
+    def query_many(
+        self,
+        query_dataset: Sequence[Sequence[Hashable]],
+        query_entities_names: Sequence[Any] = None,
+    ) -> Set[Tuple[Union[Any, int], Union[Any, int], float]]:
         """
-        Transform a dataset to a numeric format - assign index to each unique value and replace input values with index
-        :param dataset: iterable of feature vectors like ["a", "b", "c", "c"], ["d", "b"], ...
-        :return: generator of integer_dataset - [0, 1, 2, 2], [3, 1], ...
+        Query batch of vector features to index
+        :param query_dataset: sequence of vector features will be in query
+        :param query_entities_names: sequence of entities names for each query vector
+        :return: set of tuples `(query_entity_name/index_from_query_dataset,
+                                 indexed_entity_name/index_from_indexed_dataset,
+                                 similarity_score
+                                )` for truly similar feature vectors
         """
-        for features in dataset:
-            yield np.array(
-                [
-                    self.feature_to_index.setdefault(
-                        feature, len(self.feature_to_index)
-                    )
-                    for feature in features
-                ],
-                dtype=np.int32,
+        if query_entities_names is None:
+            query_entities_names = list(range(len(query_dataset)))
+        numeric_query_features_dataset = self._encode_queries(query_dataset)
+        query_data, query_pointers = utils.frequency_order_transform_queries(
+            numeric_query_features_dataset, self.feature_to_frequency_id
+        )
+        result = utils.query_batch(
+            similarity_func_name=self.similarity_metric,
+            query_data=query_data,
+            query_pointers=query_pointers,
+            index=self.index,
+            feature_index_size=self.feature_index_size,
+            index_data=self.index_data,
+            index_pointers=self.index_pointers,
+            similarity_threshold=self.similarity_threshold,
+            show_progress=self.enable_progress_bar,
+            n_cores=self.n_cores,
+        )
+        return {
+            (
+                query_entities_names[index_from_query_data],
+                self.entities_names[index_from_index_data],
+                similarity_score,
             )
+            for index_from_query_data, index_from_index_data, similarity_score in result
+        }
+
+    def all_to_all(
+        self,
+        dataset: Sequence[Sequence[Hashable]],
+        entities_names: Sequence[Any] = None,
+    ) -> Set[Tuple[int, int, float]]:
+        """
+        Find all pairs of similar vectors in dataset with similarity higher that self.similarity_threshold
+        (exclude entities equal to itself)
+        :param dataset: sequence of feature vectors
+        :param entities_names: sequence of entities names for each feature vecto
+        :return: set of tuples `(index_from_dataset, index_from_dataset, similarity_score)` for truly similar feature
+                 vectors
+        """
+        self.build_index(index_dataset=dataset, entities_names=entities_names)
+        pairs = self.query_many(
+            query_dataset=dataset, query_entities_names=entities_names
+        )
+        is_symmetric_similarity_function = (
+            self.similarity_metric in utils.SYMMETRIC_SIMILARITY_METRICS
+        )
+
+        result_pairs = set()
+        for p in pairs:
+            if p[0] != p[1]:
+                if is_symmetric_similarity_function:
+                    result_pairs.add((*sorted([p[0], p[1]], reverse=True), p[2]))
+                else:
+                    result_pairs.add(p)
+        return result_pairs
 
     def save_index(self, save_directory: str) -> None:
         """
@@ -100,50 +167,12 @@ class SetSimSearcher:
         """
         self._load_index(index_directory=index_directory, mmap=mmap)
 
-    def _load_index(self, index_directory: str, mmap: bool = False) -> None:
-        """
-        Load index from storage directory at disk
-        :param index_directory: path to folder where index is stored
-        :param mmap: if mmap loaded index and indexed_data or not
-        """
-        index_dir = Path(index_directory)
-        self.index_data = np.load(
-            index_dir / "index_data.npy", mmap_mode="r" if mmap else None
-        )
-        self.index_pointers = np.load(index_dir / "index_pointers.npy")
-        self.index = np.load(index_dir / "index.npy", mmap_mode="r" if mmap else None)
-        self.feature_to_frequency_id = np.load(index_dir / "token2id.npy")
-        self.feature_index_size = np.load(index_dir / "token_index_size.npy")
-        self.entities_names = np.load(index_dir / "entities_names.npy")
-        self.feature_to_index = np.load(
-            index_dir / "feature_to_index.npy", allow_pickle=True
-        ).item()
-
-    def _init_index_structures(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-        """
-        Init index structures for index building step
-        :return: feature_index_size - empty matrix with start and end positions for each token in index
-                 current_feature_pos - empty array which will maintain current position for each token in index
-                 index_prefix_sizes - size of prefix for each feature vector
-                 index_size - size of index
-        """
-        n_tokens = len(self.feature_to_frequency_id)
-        feature_index_size = np.zeros((n_tokens, 2), dtype=np.int32)
-        current_feature_pos = np.zeros((n_tokens,), dtype=np.int32)
-        index_prefix_sizes = np.zeros((self.index_pointers.shape[0],), dtype=np.int32)
-        index_size = utils._CALCULATE_INDEX_SIZE_FUNCS[self.similarity_metric](
-            pointers=self.index_pointers,
-            prefix_sizes=index_prefix_sizes,
-            similarity_threshold=self.similarity_threshold,
-        )
-        return feature_index_size, current_feature_pos, index_prefix_sizes, index_size
-
     def build_index(
-        self,
-        index_dataset: Iterable[Sequence[Hashable]],
-        features_lengths: np.ndarray = None,
-        entities_names: Sequence[Any] = None,
-        mmap: bool = False,
+            self,
+            index_dataset: Iterable[Sequence[Hashable]],
+            features_lengths: np.ndarray = None,
+            entities_names: Sequence[Any] = None,
+            mmap: bool = False,
     ) -> None:
         """
         Build index for dataset
@@ -155,7 +184,7 @@ class SetSimSearcher:
         logging.debug("Starting: building index step")
         process = psutil.Process(os.getpid())
         logging.debug(
-            f"Process taken memory beginning build index MB {process.memory_info().rss / 1024**2}"
+            f"Process taken memory beginning build index MB {process.memory_info().rss / 1024 ** 2}"
         )
 
         logging.debug("Starting: checking features_lengths")
@@ -228,6 +257,73 @@ class SetSimSearcher:
         )
         logging.debug("Finished: building index step")
 
+    def _init_empty_index(self):
+        """Initialize empty datastructures for index"""
+        self.index_data = None
+        self.index_pointers = None
+        self.index = None
+        self.feature_to_frequency_id = None
+        self.feature_index_size = None
+        self.feature_to_index = None
+        self.entities_names = None
+
+    def _encode_features(
+        self, dataset: Iterable[Sequence[Hashable]]
+    ) -> Iterable[np.ndarray]:
+        """
+        Transform a dataset to a numeric format - assign index to each unique value and replace input values with index
+        :param dataset: iterable of feature vectors like ["a", "b", "c", "c"], ["d", "b"], ...
+        :return: generator of integer_dataset - [0, 1, 2, 2], [3, 1], ...
+        """
+        for features in dataset:
+            yield np.array(
+                [
+                    self.feature_to_index.setdefault(
+                        feature, len(self.feature_to_index)
+                    )
+                    for feature in features
+                ],
+                dtype=np.int32,
+            )
+
+    def _load_index(self, index_directory: str, mmap: bool = False) -> None:
+        """
+        Load index from storage directory at disk
+        :param index_directory: path to folder where index is stored
+        :param mmap: if mmap loaded index and indexed_data or not
+        """
+        index_dir = Path(index_directory)
+        self.index_data = np.load(
+            index_dir / "index_data.npy", mmap_mode="r" if mmap else None
+        )
+        self.index_pointers = np.load(index_dir / "index_pointers.npy")
+        self.index = np.load(index_dir / "index.npy", mmap_mode="r" if mmap else None)
+        self.feature_to_frequency_id = np.load(index_dir / "token2id.npy")
+        self.feature_index_size = np.load(index_dir / "token_index_size.npy")
+        self.entities_names = np.load(index_dir / "entities_names.npy")
+        self.feature_to_index = np.load(
+            index_dir / "feature_to_index.npy", allow_pickle=True
+        ).item()
+
+    def _init_index_structures(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        """
+        Init index structures for index building step
+        :return: feature_index_size - empty matrix with start and end positions for each token in index
+                 current_feature_pos - empty array which will maintain current position for each token in index
+                 index_prefix_sizes - size of prefix for each feature vector
+                 index_size - size of index
+        """
+        n_tokens = len(self.feature_to_frequency_id)
+        feature_index_size = np.zeros((n_tokens, 2), dtype=np.int32)
+        current_feature_pos = np.zeros((n_tokens,), dtype=np.int32)
+        index_prefix_sizes = np.zeros((self.index_pointers.shape[0],), dtype=np.int32)
+        index_size = utils._CALCULATE_INDEX_SIZE_FUNCS[self.similarity_metric](
+            pointers=self.index_pointers,
+            prefix_sizes=index_prefix_sizes,
+            similarity_threshold=self.similarity_threshold,
+        )
+        return feature_index_size, current_feature_pos, index_prefix_sizes, index_size
+
     def _encode_queries(
         self, query_dataset: Sequence[Sequence[Hashable]]
     ) -> List[np.ndarray]:
@@ -249,97 +345,4 @@ class SetSimSearcher:
             encoded_queries.append(np.array(numeric_query_features))
         return encoded_queries
 
-    def query(self, features: Sequence[Hashable]) -> Set[Tuple[Union[Any, int], float]]:
-        """
-        Query features to index
-        :param features: feature vector
-        :return: list of tuples `(candidate_entity_name/candidate_index, similarity_score)` for truly similar vectors
-        """
-        query_features = self._encode_queries([features])
-        query_data, _ = utils.frequency_order_transform_queries(
-            queries_dataset=query_features,
-            feature_to_frequency_id=self.feature_to_frequency_id,
-        )
-        result_set = utils.query(
-            similarity_metric_name=self.similarity_metric,
-            query_features=query_data,
-            index=self.index,
-            feature_index_size=self.feature_index_size,
-            index_data=self.index_data,
-            index_pointers=self.index_pointers,
-            similarity_threshold=self.similarity_threshold,
-        )
-        return {
-            (self.entities_names[candidate_index], similarity_score)
-            for candidate_index, similarity_score in result_set
-        }
 
-    def query_many(
-        self,
-        query_dataset: Sequence[Sequence[Hashable]],
-        query_entities_names: Sequence[Any] = None,
-    ) -> Set[Tuple[Union[Any, int], Union[Any, int], float]]:
-        """
-        Query batch of vector features to index
-        :param query_dataset: sequence of vector features will be in query
-        :param query_entities_names: sequence of entities names for each query vector
-        :return: set of tuples `(query_entity_name/index_from_query_dataset,
-                                 indexed_entity_name/index_from_indexed_dataset,
-                                 similarity_score
-                                )` for truly similar feature vectors
-        """
-        if query_entities_names is None:
-            query_entities_names = list(range(len(query_dataset)))
-        numeric_query_features_dataset = self._encode_queries(query_dataset)
-        query_data, query_pointers = utils.frequency_order_transform_queries(
-            numeric_query_features_dataset, self.feature_to_frequency_id
-        )
-        result = utils.query_batch(
-            similarity_func_name=self.similarity_metric,
-            query_data=query_data,
-            query_pointers=query_pointers,
-            index=self.index,
-            feature_index_size=self.feature_index_size,
-            index_data=self.index_data,
-            index_pointers=self.index_pointers,
-            similarity_threshold=self.similarity_threshold,
-            show_progress=self.enable_progress_bar,
-            n_cores=self.n_cores,
-        )
-        return {
-            (
-                query_entities_names[index_from_query_data],
-                self.entities_names[index_from_index_data],
-                similarity_score,
-            )
-            for index_from_query_data, index_from_index_data, similarity_score in result
-        }
-
-    def all_pairs(
-        self,
-        dataset: Sequence[Sequence[Hashable]],
-        entities_names: Sequence[Any] = None,
-    ) -> Set[Tuple[int, int, float]]:
-        """
-        Find all pairs of similar vectors in dataset with similarity higher that self.similarity_threshold
-        :param dataset: sequence of feature vectors
-        :param entities_names: sequence of entities names for each feature vecto
-        :return: set of tuples `(index_from_dataset, index_from_dataset, similarity_score)` for truly similar feature
-                 vectors
-        """
-        self.build_index(index_dataset=dataset, entities_names=entities_names)
-        pairs = self.query_many(
-            query_dataset=dataset, query_entities_names=entities_names
-        )
-        is_symmetric_similarity_function = (
-            self.similarity_metric in utils.SYMMETRIC_SIMILARITY_METRICS
-        )
-
-        result_pairs = set()
-        for p in pairs:
-            if p[0] != p[1]:
-                if is_symmetric_similarity_function:
-                    result_pairs.add((*sorted([p[0], p[1]], reverse=True), p[2]))
-                else:
-                    result_pairs.add(p)
-        return result_pairs
