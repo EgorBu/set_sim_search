@@ -19,8 +19,8 @@ SetSimSearcher is a Python library designed for efficient and simple multiset si
 To install SetSimSearcher, clone this repository and install the required dependencies.
 
 ```bash
-git clone https://github.com/your-repository/SetSimSearcher.git
-cd SetSimSearcher
+git clone https://github.com/EgorBu/set_sim_search.git
+cd set_sim_search
 pip install -r requirements.txt
 ```
 
